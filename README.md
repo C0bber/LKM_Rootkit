@@ -6,5 +6,5 @@ Linux Kernel Module rootkit coded in C.
 - [x] Hiding itself
 - [x] Hiding processes
 - [x] A backdoor to root 
-- [x] Backdooring PRNGs (needs some fixes)
+- [x] Hiding files or directories starting with the PREFIX
 - [x] Hiding users
