@@ -8,3 +8,4 @@ Linux Kernel Module rootkit coded in C.
 - [x] A backdoor to root 
 - [x] Hiding files or directories starting with the PREFIX
 - [x] Hiding users
+- [x] Hiding ports
