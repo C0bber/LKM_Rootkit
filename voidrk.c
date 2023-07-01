@@ -7,7 +7,7 @@
 #include <linux/kallsyms.h>
 #include <asm/uaccess.h>
 #include <linux/uaccess.h>
-#include<linux/sched.h>
+#include <linux/sched.h>
 #include <linux/proc_fs.h>
 #include <linux/proc_ns.h>
 #include <linux/dirent.h>
